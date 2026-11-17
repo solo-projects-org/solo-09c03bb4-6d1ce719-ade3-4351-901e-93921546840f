@@ -4,6 +4,10 @@
 **全量 SELECT** 与**增量 SQL**，服务会自动找出增量维护净额表时的错误，并把导致错误的
 变更批次缩减到最小（保留原批号与原顺序），返回精简输入、首次差异批号以及缺失/多余行。
 
+另提供**订单实体沿革 API**（`/v1/lineage`）：提交同一格式的初态、顺序批次和一个初态
+订单号，返回该实体从初态到各批末的订单行、归属退款、净额及影响它的批内变更序号，
+用于核清一笔订单净额的来龙去脉（见下文[订单实体沿革](#订单实体沿革-api)）。
+
 ## 快速开始
 
 ```bash
@@ -46,6 +50,69 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 即：原本 6 个批次里只剩 2 个（101 插入退款、103 删除退款）；批次 101 无法删除，因为
 删掉后批次 103 的删除目标不存在，输入非法。`examples/correct_incremental.json` 是正确
 实现，返回 `no_difference`。
+
+## 订单实体沿革 API
+
+`POST /v1/lineage` 追踪**一笔订单实体**从初态到各批末的净额来龙去脉，不需要 SQL：
+
+```jsonc
+// 请求
+{
+  "initial": {"orders": [...], "refunds": [...]},   // 与 /v1/minimize 相同格式
+  "batches": [{"batch_id": 3, "changes": [...]}, ...], // 顺序批次，可为空（只看初态）
+  "order_id": 1001                                   // 初态订单号
+}
+```
+
+```jsonc
+// 响应
+{
+  "status": "ok",                  // ok / order_not_found / net_amount_overflow
+  "order_id": 1001,                // 回显初态订单号
+  "snapshots": [
+    {
+      "batch_id": null,            // null = 初态，其余为原批号
+      "order":  {"order_id": 1001, "amount": 5000},
+      "refunds": [{"refund_id": 9001, "order_id": 1001, "amount": 1200}],
+      "net_amount": 3800,          // 订单金额 − 归属退款合计
+      "change_seqs": []            // 本批内影响该实体的变更序号（批内 seq，从 0 开始）
+    },
+    {"batch_id": 3, "order": {"order_id": 1005, "amount": 6000}, ...},
+    {"batch_id": 7, "order": null, "refunds": [], "net_amount": null,
+     "change_seqs": [1]}           // 实体在批次 7 被删除，沿革终止
+  ],
+  "terminated": true,
+  "terminated_batch_id": 7,
+  "notes": [...]
+}
+```
+
+### 实体身份与归属规则
+
+- **改号仍追踪原实体**：`update` 修改订单主键（含同一批内连续改号）时，沿革跟随新号。
+- **删后重插 / 旧号复用不接旧沿革**：实体被 `delete` 即终止；同批重插同号订单、或后续
+  批次复用旧号插入的新订单，都是**新实体**，不会并入旧沿革，其变更也不会出现在旧沿革
+  的 `change_seqs` 中。实体删除后记录终止：删除所在批为最后一个快照
+  （`order`/`net_amount` 为 `null`），之后的批次不再产生快照。
+- **退款改绑按批末归属计算**：每个快照点的"归属退款"是该时点状态中
+  `order_id` 等于实体当前主键的退款；批内多次改绑只看批末结果。
+- **影响序号 `change_seqs`**：批内满足任一条件的变更序号——
+  1. 改/删实体订单行（按实体身份追踪，改号链也算）；
+  2. 增/改/删在**上一快照或本批末**归属该实体的退款（改绑进、改绑出都算；
+     批内先插后删、两个边界都不归属的退款不出现）。
+- **沿用现有批次事务与外键规则**：批次按输入顺序应用，批末必须满足主键唯一与
+  `refunds.order_id → orders.order_id` 外键。任一批次非法 → 整次查询不交付沿革
+  （HTTP 422）。
+- **净额 64 位整数范围**：任一快照点净额超出 `[-2^63, 2^63-1]` → 整次查询不交付沿革，
+  返回 `status = net_amount_overflow` 且 `snapshots` 为空（`notes` 指明溢出位置）。
+- 初态中不存在该订单号 → `status = order_not_found`，`snapshots` 为空。
+
+```bash
+curl -s -X POST http://localhost:8000/v1/lineage \
+     -H 'content-type: application/json' \
+     -d '{"initial": {"orders": [{"order_id": 1, "amount": 1000}], "refunds": []},
+          "batches": [], "order_id": 1}' | python3 -m json.tool
+```
 
 ## 数据模型与执行契约
 
@@ -180,14 +247,15 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 
 ```
 app/
-  main.py       FastAPI 应用与端点
+  main.py       FastAPI 应用与端点（/v1/minimize、/v1/validate、/v1/lineage）
   models.py     Pydantic 请求/响应模型
   validate.py   初始数据与批次合法性、CDC 记录
+  lineage.py    订单实体沿革：身份追踪、批末归属、净额与影响序号
   schema.py     SQLite 表结构与序列化
   sqlguard.py   SQL 策略（文本预检 + authorizer）
   executor.py   单次试验：重建库、逐批事务、多重集比较
   reducer.py    ddmin 缩减与最小性认证
   config.py     环境变量配置
-tests/          92 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、API、契约）
+tests/          121 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、沿革、API、契约）
 examples/       正确实现与漏删退款的反例
 ```

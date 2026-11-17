@@ -15,9 +15,13 @@ from fastapi import FastAPI, HTTPException
 
 from . import __version__, config
 from .executor import Executor
+from .lineage import trace_lineage
 from .models import (
     Batch,
     DifferenceDetail,
+    LineageRequest,
+    LineageResponse,
+    LineageSnapshot,
     MinimizeRequest,
     MinimizeResponse,
     ValidateRequest,
@@ -118,6 +122,41 @@ def minimize(request: MinimizeRequest) -> MinimizeResponse:
         notes=outcome.notes,
         blocked_by=outcome.blocked_by,
         evaluations=outcome.evaluations,
+    )
+
+
+@app.post(
+    "/v1/lineage",
+    response_model=LineageResponse,
+    summary="订单实体沿革：从初态到各批末追踪一笔订单净额",
+    tags=["沿革"],
+    responses={
+        422: {"description": "初态或批次非法（沿用现有批次事务与外键规则）"},
+    },
+)
+def lineage(request: LineageRequest) -> LineageResponse:
+    # 非法批次 → 整次查询不交付沿革（与既有接口一致的 422）。
+    try:
+        validate_all(request.initial, request.batches)
+    except InputError as exc:
+        raise HTTPException(status_code=422, detail=f"输入非法: {exc}") from exc
+    result = trace_lineage(request.initial, request.batches, request.order_id)
+    return LineageResponse(
+        status=result.status,  # type: ignore[arg-type]
+        order_id=result.order_id,
+        snapshots=[
+            LineageSnapshot(
+                batch_id=snap.batch_id,
+                order=snap.order,
+                refunds=snap.refunds,
+                net_amount=snap.net_amount,
+                change_seqs=snap.change_seqs,
+            )
+            for snap in result.snapshots
+        ],
+        terminated=result.terminated,
+        terminated_batch_id=result.terminated_batch_id,
+        notes=result.notes,
     )
 
 

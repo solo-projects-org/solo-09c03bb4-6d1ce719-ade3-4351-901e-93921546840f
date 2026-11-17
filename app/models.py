@@ -164,6 +164,65 @@ class ValidateRequest(BaseModel):
     sql: SqlBundle
 
 
+class LineageRequest(BaseModel):
+    """订单实体沿革查询：初态 + 顺序批次 + 初态订单号。"""
+
+    initial: InitialData
+    batches: list[Batch] = Field(
+        default_factory=list,
+        max_length=20,
+        description="顺序批次（批号顺序即输入顺序）；为空时只返回初态快照",
+    )
+    order_id: int = Field(..., ge=1, description="初态订单号（被追踪实体的初始主键）")
+
+    @model_validator(mode="after")
+    def _unique_batches(self) -> "LineageRequest":
+        ids = [b.batch_id for b in self.batches]
+        if len(ids) != len(set(ids)):
+            raise ValueError("batch_id 必须唯一")
+        return self
+
+
+class LineageSnapshot(BaseModel):
+    batch_id: int | None = Field(..., description="原批号；null 表示初态")
+    order: OrderRow | None = Field(
+        ..., description="该时点实体的订单行（改号后为新主键）；实体删除后为 null"
+    )
+    refunds: list[RefundRow] = Field(
+        default_factory=list, description="该时点归属该实体的退款（按批末归属计算）"
+    )
+    net_amount: int | None = Field(
+        ..., description="净额 = 订单金额 − 归属退款合计；实体删除后为 null"
+    )
+    change_seqs: list[int] = Field(
+        default_factory=list,
+        description=(
+            "本批内影响该实体订单行或归属退款的变更序号（批内 seq，从 0 开始）；"
+            "初态快照恒为空"
+        ),
+    )
+
+
+class LineageResponse(BaseModel):
+    status: Literal["ok", "order_not_found", "net_amount_overflow"] = Field(
+        ...,
+        description=(
+            "ok=已交付沿革；order_not_found=初态无此订单号；"
+            "net_amount_overflow=某时点净额超出 64 位整数范围，整次查询不交付沿革"
+        ),
+    )
+    order_id: int = Field(..., description="请求中的初态订单号")
+    snapshots: list[LineageSnapshot] = Field(
+        default_factory=list,
+        description="从初态到各批末的快照；实体删除后记录终止；不交付时为空",
+    )
+    terminated: bool = Field(..., description="实体是否在某批被删除")
+    terminated_batch_id: int | None = Field(
+        None, description="实体被删除的原批号；未删除为 null"
+    )
+    notes: list[str] = Field(default_factory=list, description="判定依据说明")
+
+
 class ValidateResponse(BaseModel):
     outcome: Literal["ok", "different", "error", "timeout"] = Field(
         ..., description="完整输入一次重放的结果"
